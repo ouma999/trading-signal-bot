@@ -41,6 +41,7 @@ and only messages you again when a NEW strong signal appears (won't spam you
 with the same signal repeatedly).
 """
 
+import os
 import time
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -54,11 +55,49 @@ import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------------------------------------------------------------------------
-# CONFIG -- fill these in
+# CONFIG
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "8857807265:AAHyh8ODpp7P3S8eCxrhc7gRgfxXeV8cR2g"
-CHAT_ID =7887326351
+# Reads from environment variables first (used on Railway/cloud deployment).
+# Falls back to the hardcoded strings below for local testing only --
+# if you deploy, set these as Variables in Railway instead of editing here.
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8857807265:AAHyh8ODpp7P3S8eCxrhc7gRgfxXeV8cR2g")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7887326351")
+
+# FRED (Federal Reserve Economic Data) -- free API key, get one at:
+# https://fred.stlouisfed.org/docs/api/api_key.html (instant, no cost)
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "45a2afb8f3bf7985902f0aba422db078")
+
+# Confirmed 2026 FOMC meeting dates (verified against federalreserve.gov, July 2026).
+# The rate decision is announced on the SECOND day of each meeting.
+FOMC_MEETING_DATES_2026 = [
+    dt.date(2026, 1, 28),
+    dt.date(2026, 3, 18),
+    dt.date(2026, 4, 29),
+    dt.date(2026, 6, 17),
+    dt.date(2026, 7, 29),
+    dt.date(2026, 9, 16),
+    dt.date(2026, 10, 28),
+    dt.date(2026, 12, 9),
+]
+EVENT_WARNING_DAYS = 3       # flag FOMC meetings within this many days
+EARNINGS_WARNING_DAYS = 7    # flag earnings within this many days
+
+# Which direction each instrument tends to move when US rates FALL.
+# +1 = bullish when rates fall (bearish when rates rise)
+# -1 = bearish when rates fall (bullish when rates rise)
+# Simplified real-world logic:
+#   Falling rates -> weaker USD -> bullish gold & oil (priced in USD),
+#                    bullish growth stocks like NVDA (cheaper future cash flows),
+#                    bearish USD/CAD, bearish bank stocks (lower net interest margin)
+MACRO_RATE_SENSITIVITY = {
+    "NVDA":   1,
+    "GS":    -1,
+    "JPM":   -1,
+    "XAUUSD": 1,
+    "WTI":    1,
+    "USDCAD":-1,
+}
 
 # is_stock=True  -> only checked/alerted during NYSE hours (9:30am-4:00pm ET, Mon-Fri)
 # is_stock=False -> trades ~24/5 (forex, gold, oil), checked continuously
@@ -205,10 +244,103 @@ def get_news_sentiment(query, max_items=NEWS_MAX_ITEMS):
 
 
 # ---------------------------------------------------------------------------
+# MACRO / FUNDAMENTAL LAYER (FRED interest rates + FOMC/earnings event risk)
+# ---------------------------------------------------------------------------
+
+_fred_cache = {}  # simple in-memory cache so we don't hammer the API every check
+
+def get_fed_funds_rate_trend():
+    """Returns 'rising', 'falling', 'flat', or None (if unavailable)."""
+    if "fed_trend" in _fred_cache:
+        return _fred_cache["fed_trend"]
+
+    if not FRED_API_KEY or FRED_API_KEY == "PASTE_YOUR_FRED_KEY_HERE":
+        return None
+
+    try:
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": "FEDFUNDS",
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 3,
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        obs = resp.json()["observations"]
+        values = [float(o["value"]) for o in obs if o["value"] != "."]
+
+        if len(values) < 2:
+            trend = None
+        elif values[0] > values[1]:
+            trend = "rising"
+        elif values[0] < values[1]:
+            trend = "falling"
+        else:
+            trend = "flat"
+
+        _fred_cache["fed_trend"] = trend
+        return trend
+    except Exception as e:
+        print(f"  FRED fetch failed: {e}")
+        return None
+
+
+def get_macro_signal(key):
+    """Returns (score_contribution, reason_text) based on Fed rate trend."""
+    trend = get_fed_funds_rate_trend()
+    sensitivity = MACRO_RATE_SENSITIVITY.get(key, 0)
+
+    if trend is None or sensitivity == 0:
+        return 0, None
+
+    if trend == "rising":
+        contribution = -sensitivity
+    elif trend == "falling":
+        contribution = sensitivity
+    else:
+        return 0, "Fed funds rate flat -- no macro bias"
+
+    direction = "bullish" if contribution > 0 else "bearish"
+    return contribution, f"macro: Fed rate {trend} -- {direction} bias for this instrument"
+
+
+def get_event_risk_warnings(key, meta):
+    """Returns a list of warning strings for upcoming high-impact events."""
+    warnings_list = []
+    today = dt.date.today()
+
+    # FOMC meeting proximity (affects all instruments, especially gold/financials)
+    for meeting_date in FOMC_MEETING_DATES_2026:
+        days_away = (meeting_date - today).days
+        if 0 <= days_away <= EVENT_WARNING_DAYS:
+            warnings_list.append(f"FOMC meeting in {days_away} day(s) ({meeting_date}) -- expect volatility")
+            break
+
+    # Earnings proximity (stocks only)
+    if meta.get("is_stock"):
+        try:
+            ticker_obj = yf.Ticker(meta["yf_ticker"])
+            earnings_dates = ticker_obj.get_earnings_dates(limit=4)
+            if earnings_dates is not None and not earnings_dates.empty:
+                for idx in earnings_dates.index:
+                    edate = idx.date() if hasattr(idx, "date") else idx
+                    days_away = (edate - today).days
+                    if 0 <= days_away <= EARNINGS_WARNING_DAYS:
+                        warnings_list.append(f"Earnings in {days_away} day(s) ({edate}) -- expect a gap risk")
+                        break
+        except Exception as e:
+            print(f"  Earnings calendar fetch failed for {key}: {e}")
+
+    return warnings_list
+
+
+# ---------------------------------------------------------------------------
 # COMPOSITE SIGNAL + STOP LOSS / TAKE PROFIT
 # ---------------------------------------------------------------------------
 
-def build_signal(tech, sentiment):
+def build_signal(tech, sentiment, macro_key=None, event_warnings=None):
     if tech is None:
         return None
 
@@ -243,10 +375,20 @@ def build_signal(tech, sentiment):
         score -= 1
         reasons.append(f"news sentiment negative ({sentiment['avg_sentiment']:.2f})")
 
+    # Macro layer: Fed rate trend, mapped per-instrument (see MACRO_RATE_SENSITIVITY)
+    macro_contribution, macro_reason = (0, None)
+    if macro_key is not None:
+        macro_contribution, macro_reason = get_macro_signal(macro_key)
+        if macro_contribution != 0:
+            score += macro_contribution
+        if macro_reason:
+            reasons.append(macro_reason)
+
     direction = "BUY" if score > 0 else ("SELL" if score < 0 else "NEUTRAL")
 
-    # confidence = how many of the 4 signal components agree (trend, RSI, MACD, sentiment)
-    max_components = 4
+    # confidence = how many of the 5 signal components agree
+    # (trend, RSI, MACD, sentiment, macro) -- macro only counts if available
+    max_components = 5 if macro_key is not None else 4
     base_confidence = min(abs(score), max_components) / max_components * 100
 
     # volume acts as a modifier, not a scored component -- confirms conviction
@@ -260,6 +402,11 @@ def build_signal(tech, sentiment):
     else:
         confidence = round(base_confidence * 0.75)
         reasons.append(f"volume below average ({tech['volume_ratio']:.1f}x avg) — weaker conviction")
+
+    # Event-risk warnings (FOMC, earnings) -- informational, not scored,
+    # since a scheduled event can invalidate technical/sentiment signals via a gap
+    if event_warnings:
+        reasons.extend(f"⚠️ {w}" for w in event_warnings)
 
     price = tech["last_price"]
     atr = tech["atr"]
@@ -382,7 +529,8 @@ def check_and_alert():
         try:
             tech = get_technicals(meta["yf_ticker"])
             sentiment = get_news_sentiment(meta["news_query"])
-            sig = build_signal(tech, sentiment)
+            event_warnings = get_event_risk_warnings(key, meta)
+            sig = build_signal(tech, sentiment, macro_key=key, event_warnings=event_warnings)
 
             if sig is None:
                 print(f"  {key}: no data")
