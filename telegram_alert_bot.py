@@ -41,10 +41,8 @@ and only messages you again when a NEW strong signal appears (won't spam you
 with the same signal repeatedly).
 """
 
-import os
 import time
 import datetime as dt
-from zoneinfo import ZoneInfo
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -52,21 +50,16 @@ import pandas as pd
 import yfinance as yf
 import feedparser
 import requests
+from zoneinfo import ZoneInfo
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG -- fill these in
 # ---------------------------------------------------------------------------
 
-# Reads from environment variables first (used on Railway/cloud deployment).
-# Falls back to the hardcoded strings below for local testing only --
-# if you deploy, set these as Variables in Railway instead of editing here.
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8857807265:AAHyh8ODpp7P3S8eCxrhc7gRgfxXeV8cR2g")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7887326351")
-
-# FRED (Federal Reserve Economic Data) -- free API key, get one at:
-# https://fred.stlouisfed.org/docs/api/api_key.html (instant, no cost)
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "45a2afb8f3bf7985902f0aba422db078")
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+CHAT_ID = "PASTE_YOUR_CHAT_ID_HERE"
+FRED_API_KEY = "PASTE_YOUR_FRED_KEY_HERE"
 
 # Confirmed 2026 FOMC meeting dates (verified against federalreserve.gov, July 2026).
 # The rate decision is announced on the SECOND day of each meeting.
@@ -112,6 +105,7 @@ WATCHLIST = {
 
 CHECK_INTERVAL_MINUTES = 30     # how often to re-check the watchlist
 MIN_ABS_SCORE_TO_ALERT = 2      # only alert on ALIGNED signals (score +-2 or more)
+MIN_CONFIDENCE_TO_ALERT = 40    # in percent -- only alert if this many indicators agree
 ATR_STOP_MULTIPLE = 1.5         # stop loss = price -+ (ATR * this)
 ATR_TARGET_MULTIPLE = 2.5       # take profit = price -+ (ATR * this) -> ~1.6:1 reward:risk
 
@@ -202,7 +196,7 @@ def get_technicals(ticker):
     current_volume = float(last["Volume"])
     avg_volume = float(last["Vol_avg20"]) if pd.notna(last["Vol_avg20"]) else current_volume
     if avg_volume <= 0:
-        # Forex pairs / some futures report no reliable volume via yfinance —
+        # Forex pairs / some futures report no reliable volume via yfinance --
         # treat as "no data" rather than penalizing the signal unfairly.
         volume_ratio = None
         volume_confirmed = None
@@ -401,12 +395,12 @@ def build_signal(tech, sentiment, macro_key=None, event_warnings=None):
         reasons.append(f"volume confirms move ({tech['volume_ratio']:.1f}x avg)")
     else:
         confidence = round(base_confidence * 0.75)
-        reasons.append(f"volume below average ({tech['volume_ratio']:.1f}x avg) — weaker conviction")
+        reasons.append(f"volume below average ({tech['volume_ratio']:.1f}x avg) -- weaker conviction")
 
     # Event-risk warnings (FOMC, earnings) -- informational, not scored,
     # since a scheduled event can invalidate technical/sentiment signals via a gap
     if event_warnings:
-        reasons.extend(f"⚠️ {w}" for w in event_warnings)
+        reasons.extend(f"WARNING: {w}" for w in event_warnings)
 
     price = tech["last_price"]
     atr = tech["atr"]
@@ -446,25 +440,27 @@ def send_telegram_message(text):
         return False
 
 
-def format_alert(key, meta, sig):
-    arrow = "🟢 BUY" if sig["direction"] == "BUY" else ("🔴 SELL" if sig["direction"] == "SELL" else "⚪ NEUTRAL")
-    reasons_txt = "\n".join(f"  • {r}" for r in sig["reasons"])
+def format_alert(key, meta, sig, session_label=None):
+    arrow = "BUY (up)" if sig["direction"] == "BUY" else ("SELL (down)" if sig["direction"] == "SELL" else "NEUTRAL")
+    reasons_txt = "\n".join(f"  - {r}" for r in sig["reasons"])
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     lines = [
-        f"🚨 <b>SIGNAL ALERT — {meta['name']} ({key})</b>",
+        f"SIGNAL ALERT -- {meta['name']} ({key})",
         f"Time: {now}",
         f"Direction: {arrow}",
         f"Confidence: {sig['confidence']}%",
         f"Price: {sig['price']:.4f}",
     ]
+    if session_label:
+        lines.append(f"Entry timing: {session_label}")
     if sig["stop_loss"] is not None:
         lines.append(f"Stop Loss: {sig['stop_loss']:.4f}")
         lines.append(f"Take Profit: {sig['take_profit']:.4f}")
     lines.append("Why:")
     lines.append(reasons_txt)
     lines.append("")
-    lines.append("⚠️ Not financial advice. Confidence = how many signals agree, not a win probability. Confirm before trading.")
+    lines.append("Not financial advice. Confidence = how many signals agree, not a win probability. Confirm before trading.")
     return "\n".join(lines)
 
 
@@ -492,18 +488,60 @@ def get_market_status():
 
 
 # ---------------------------------------------------------------------------
+# TRADING SESSION / ENTRY-TIMING LABEL
+# ---------------------------------------------------------------------------
+
+OPENING_WINDOW_MINUTES = 30   # first N minutes after open = "opening window"
+
+def get_trading_session(meta, status, now_et):
+    """Returns a short label describing how favorable right now is for entry,
+    used only for display in the alert -- does not affect scoring."""
+    if meta["is_stock"]:
+        if status != "open":
+            return "Market closed"
+        minutes_since_open = (
+            dt.datetime.combine(now_et.date(), now_et.time())
+            - dt.datetime.combine(now_et.date(), MARKET_OPEN)
+        ).total_seconds() / 60
+        if 0 <= minutes_since_open <= OPENING_WINDOW_MINUTES:
+            return "Opening window (first 30 min -- high volatility, wider spreads)"
+        minutes_to_close = (
+            dt.datetime.combine(now_et.date(), MARKET_CLOSE)
+            - dt.datetime.combine(now_et.date(), now_et.time())
+        ).total_seconds() / 60
+        if 0 <= minutes_to_close <= OPENING_WINDOW_MINUTES:
+            return "Closing window (last 30 min -- high volatility, wider spreads)"
+        return "Regular trading hours (mid-session)"
+
+    # Non-stock instruments (gold, oil, forex) trade ~24/5 -- label by global session, in ET
+    hour = now_et.hour
+    if 8 <= hour < 12:
+        return "London/New York overlap (highest liquidity window)"
+    elif 3 <= hour < 8:
+        return "London session (good liquidity)"
+    elif 12 <= hour < 17:
+        return "New York session (good liquidity)"
+    elif 19 <= hour or hour < 3:
+        return "Asia/Tokyo session (thinner liquidity)"
+    else:
+        return "Session transition (lower liquidity -- caution)"
+
+
+# ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 
-last_alerted = {}          # key -> (direction, score) to avoid repeat alerts
+last_alerted = {}          # key -> {"signature": (direction, score), "time": datetime}
 last_headsup_date = None   # avoid sending the pre-market heads-up more than once/day
+
+REALERT_COOLDOWN_MINUTES = 120   # re-send if the same signal is still active after this long
 
 def send_premarket_headsup():
     stock_names = [meta["name"] for meta in WATCHLIST.values() if meta["is_stock"]]
     if not stock_names:
         return
     msg = (
-        f"⏰ <b>Market opens in {PRE_MARKET_HEADSUP_MINUTES} minutes</b>\n"
+        f"Market opens in {PRE_MARKET_HEADSUP_MINUTES} minutes\n"
         f"Watching: {', '.join(stock_names)}\n"
         f"Signal checks for these will resume once the market opens."
     )
@@ -538,15 +576,30 @@ def check_and_alert():
 
             print(f"  {key}: {sig['direction']} score={sig['score']} confidence={sig['confidence']}%")
 
-            if abs(sig["score"]) >= MIN_ABS_SCORE_TO_ALERT:
+            meets_score = abs(sig["score"]) >= MIN_ABS_SCORE_TO_ALERT
+            meets_confidence = sig["confidence"] >= MIN_CONFIDENCE_TO_ALERT
+
+            if meets_score and meets_confidence:
                 signature = (sig["direction"], sig["score"])
-                if last_alerted.get(key) != signature:
-                    last_alerted[key] = signature
-                    message = format_alert(key, meta, sig)
+                prev = last_alerted.get(key)
+
+                should_alert = (
+                    prev is None
+                    or prev["signature"] != signature
+                    or (now_et - prev["time"]).total_seconds() >= REALERT_COOLDOWN_MINUTES * 60
+                )
+
+                if should_alert:
+                    last_alerted[key] = {"signature": signature, "time": now_et}
+                    session_label = get_trading_session(meta, status, now_et)
+                    message = format_alert(key, meta, sig, session_label)
                     if send_telegram_message(message):
                         print(f"  -> Alert sent for {key}")
                 else:
-                    print(f"  -> Same signal as last check, skipping duplicate alert")
+                    minutes_left = REALERT_COOLDOWN_MINUTES - (now_et - prev["time"]).total_seconds() / 60
+                    print(f"  -> Same signal, next re-alert in {minutes_left:.0f} min")
+            elif meets_score and not meets_confidence:
+                print(f"  -> Score qualifies but confidence too low ({sig['confidence']}% < {MIN_CONFIDENCE_TO_ALERT}%)")
 
         except Exception as e:
             print(f"  {key}: error - {e}")
@@ -554,18 +607,34 @@ def check_and_alert():
 
 def main():
     print("Sending test message to confirm Telegram is connected...")
-    ok = send_telegram_message("✅ Trading signal bot connected. You'll get alerts here when a strong signal appears.")
+    ok = send_telegram_message("Trading signal bot connected. You'll get alerts here when a strong signal appears.")
     if not ok:
         print("Test message failed -- check your BOT_TOKEN and CHAT_ID before continuing.")
         return
 
     check_and_alert()
+    last_check_time = dt.datetime.now(MARKET_TZ)
+    last_status, _ = get_market_status()
 
-    print(f"\nRunning continuously, checking every {CHECK_INTERVAL_MINUTES} minutes. Press Ctrl+C to stop.")
+    print(f"\nRunning continuously. Full checks every {CHECK_INTERVAL_MINUTES} minutes, "
+          f"plus an immediate check the moment the market opens. Press Ctrl+C to stop.")
     try:
         while True:
-            time.sleep(CHECK_INTERVAL_MINUTES * 60)
-            check_and_alert()
+            time.sleep(60)   # poll status every minute so we can catch the open transition promptly
+            status, now_et = get_market_status()
+
+            just_opened = (status == "open" and last_status != "open")
+            interval_elapsed = (now_et - last_check_time).total_seconds() >= CHECK_INTERVAL_MINUTES * 60
+
+            if just_opened:
+                print("\nMarket just opened -- running an immediate check.")
+                check_and_alert()
+                last_check_time = now_et
+            elif interval_elapsed:
+                check_and_alert()
+                last_check_time = now_et
+
+            last_status = status
     except KeyboardInterrupt:
         print("\nStopped.")
 
