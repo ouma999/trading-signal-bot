@@ -23,7 +23,6 @@ SETUP -- ONE TIME
    b. Send: /newbot
    c. Follow the prompts (choose a name, choose a username ending in "bot")
    d. BotFather gives you a token like: 123456789:AAExampleTokenHere
-   e. Paste it into BOT_TOKEN below
 
 3. Get your chat ID:
    a. Send any message to your new bot (search its username, say "hi")
@@ -31,9 +30,14 @@ SETUP -- ONE TIME
         https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
       (replace <YOUR_TOKEN> with your real token)
    c. Look for "chat":{"id": 123456789 ...} in the response
-   d. Paste that number into CHAT_ID below
 
-4. Run it:
+4. Set these as environment variables (e.g. in Railway's Variables tab) --
+   never hardcode real credentials directly in this file:
+     TELEGRAM_BOT_TOKEN
+     TELEGRAM_CHAT_ID
+     FRED_API_KEY   (optional -- macro layer is skipped if not set)
+
+5. Run it:
      python3 telegram_alert_bot.py
 
 It sends a test message immediately, then checks every CHECK_INTERVAL_MINUTES
@@ -41,6 +45,7 @@ and only messages you again when a NEW strong signal appears (won't spam you
 with the same signal repeatedly).
 """
 
+import os
 import time
 import datetime as dt
 import warnings
@@ -54,12 +59,12 @@ from zoneinfo import ZoneInfo
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------------------------------------------------------------------------
-# CONFIG -- fill these in
+# CONFIG -- credentials read from environment variables, never hardcoded
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
-CHAT_ID = "PASTE_YOUR_CHAT_ID_HERE"
-FRED_API_KEY = "PASTE_YOUR_FRED_KEY_HERE"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
 # Confirmed 2026 FOMC meeting dates (verified against federalreserve.gov, July 2026).
 # The rate decision is announced on the SECOND day of each meeting.
@@ -248,7 +253,7 @@ def get_fed_funds_rate_trend():
     if "fed_trend" in _fred_cache:
         return _fred_cache["fed_trend"]
 
-    if not FRED_API_KEY or FRED_API_KEY == "PASTE_YOUR_FRED_KEY_HERE":
+    if not FRED_API_KEY:
         return None
 
     try:
@@ -606,10 +611,15 @@ def check_and_alert():
 
 
 def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        print("TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not set in the environment.")
+        print("Set them in Railway's Variables tab (or your local shell) before running.")
+        return
+
     print("Sending test message to confirm Telegram is connected...")
     ok = send_telegram_message("Trading signal bot connected. You'll get alerts here when a strong signal appears.")
     if not ok:
-        print("Test message failed -- check your BOT_TOKEN and CHAT_ID before continuing.")
+        print("Test message failed -- check your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID before continuing.")
         return
 
     check_and_alert()
